@@ -672,10 +672,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * Searches for PO/VB rate variances
-         * @param {string} locationFilter - Location filter
-         * @returns {Array} Raw search results
-         */
+  * Searches for PO/VB rate variances
+  * @param {string} locationFilter - Location filter
+  * @returns {Array} Raw search results
+  */
         function searchPOVBVariances(locationFilter) {
             var filters = [
                 ['type', 'anyof', 'PurchOrd'],
@@ -710,6 +710,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     search.createColumn({ name: 'tranid', label: 'PO Number' }),
                     search.createColumn({ name: 'trandate', label: 'PO Date' }),
                     search.createColumn({ name: 'entity', label: 'Vendor ID' }),
+                    search.createColumn({ name: 'altname', join: 'vendor', label: 'Vendor Display Name' }), // ADD THIS LINE
+                    search.createColumn({ name: 'entityid', join: 'vendor', label: 'Vendor Name' }), // ADD THIS LINE
                     search.createColumn({ name: 'location', label: 'Location ID' }),
                     search.createColumn({ name: 'name', join: 'location', label: 'Location Name' }),
                     search.createColumn({ name: 'lineuniquekey', label: 'PO Line Key' }),
@@ -729,42 +731,22 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             });
 
             var results = [];
-            var vendorLookup = {}; // Cache vendor lookups
 
             varianceSearch.run().each(function (result) {
                 var itemName = result.getText({ name: 'item' }) || result.getValue({ name: 'displayname', join: 'item' }) || '';
 
-                // Get vendor name via lookup
-                var vendorId = result.getValue({ name: 'entity' });
-                var vendorName = '';
-
-                if (vendorId) {
-                    // Check cache first
-                    if (vendorLookup[vendorId]) {
-                        vendorName = vendorLookup[vendorId];
-                    } else {
-                        // Lookup vendor name
-                        try {
-                            var vendorLookupResult = search.lookupFields({
-                                type: search.Type.VENDOR,
-                                id: vendorId,
-                                columns: ['entityid']
-                            });
-                            vendorName = vendorLookupResult.entityid || vendorId;
-                            vendorLookup[vendorId] = vendorName; // Cache it
-                        } catch (e) {
-                            log.error('Vendor Lookup Failed', { vendorId: vendorId, error: e.message });
-                            vendorName = vendorId;
-                        }
-                    }
-                }
+                // Get vendor display name from the search results directly (no lookup needed)
+                var vendorName = result.getValue({ name: 'altname', join: 'vendor' }) ||
+                    result.getValue({ name: 'entityid', join: 'vendor' }) ||
+                    result.getText({ name: 'entity' }) ||
+                    'Unknown Vendor';
 
                 results.push({
                     po_id: result.getValue({ name: 'internalid' }),
                     po_number: result.getValue({ name: 'tranid' }),
                     po_date: result.getValue({ name: 'trandate' }),
-                    vendor_id: vendorId,
-                    vendor_name: vendorName,
+                    vendor_id: result.getValue({ name: 'entity' }),
+                    vendor_name: vendorName, // UPDATED THIS
                     location_id: result.getValue({ name: 'location' }),
                     location_name: result.getValue({ name: 'name', join: 'location' }),
                     po_line_key: result.getValue({ name: 'lineuniquekey' }),

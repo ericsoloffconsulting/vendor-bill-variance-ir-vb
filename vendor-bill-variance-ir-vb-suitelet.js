@@ -71,6 +71,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
        */
         function handlePost(context) {
             var request = context.request;
+
+            // Check if this is a closed period adjustment request
+            if (request.parameters.action === 'closed_period_adjustment') {
+                handleClosedPeriodAdjustment(context);
+                return;
+            }
+
+            var request = context.request;
             var selectedVariances = request.parameters.selected_variances;
             var batchIndex = parseInt(request.parameters.batch_index || '0');
 
@@ -217,6 +225,302 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             }
         }
 
+        // Add this new function after handlePost:
+        /**
+         * Handles closed period adjustment request
+         * @param {Object} context
+         */
+        function handleClosedPeriodAdjustment(context) {
+            var request = context.request;
+            var vbId = request.parameters.vb_id;
+            var itemId = request.parameters.item_id;
+            var vbRate = parseFloat(request.parameters.vb_rate);
+            var irRate = parseFloat(request.parameters.ir_rate);
+            var vbNumber = request.parameters.vb_number;
+            var itemName = request.parameters.item_name;
+
+            try {
+                log.audit('Closed Period Adjustment Started', {
+                    vbId: vbId,
+                    itemId: itemId,
+                    vbRate: vbRate,
+                    irRate: irRate
+                });
+
+                // Step 1: Load vendor bill and get original total
+                var vbRecord = record.load({
+                    type: record.Type.VENDOR_BILL,
+                    id: vbId,
+                    isDynamic: false
+                });
+
+                var originalTotal = vbRecord.getValue({ fieldId: 'total' });
+                var department = null;
+
+                // Step 2: Find and update the item line
+                var itemLineCount = vbRecord.getLineCount({ sublistId: 'item' });
+                var itemLineFound = false;
+
+                for (var i = 0; i < itemLineCount; i++) {
+                    var lineItem = vbRecord.getSublistValue({
+                        sublistId: 'item',
+                        fieldId: 'item',
+                        line: i
+                    });
+
+                    if (lineItem && lineItem.toString() === itemId.toString()) {
+                        var oldRate = vbRecord.getSublistValue({
+                            sublistId: 'item',
+                            fieldId: 'rate',
+                            line: i
+                        });
+
+                        // Get department from this line
+                        department = vbRecord.getSublistValue({
+                            sublistId: 'item',
+                            fieldId: 'department',
+                            line: i
+                        });
+
+                        // Update rate to match IR
+                        vbRecord.setSublistValue({
+                            sublistId: 'item',
+                            fieldId: 'rate',
+                            line: i,
+                            value: irRate
+                        });
+
+                        itemLineFound = true;
+                        log.debug('Item Line Updated', {
+                            line: i,
+                            oldRate: oldRate,
+                            newRate: irRate,
+                            department: department
+                        });
+                        break;
+                    }
+                }
+
+                if (!itemLineFound) {
+                    throw new Error('Item not found on Vendor Bill');
+                }
+
+                // Step 3: Calculate adjustment amount (difference to offset)
+                var adjustmentAmount = vbRate - irRate;
+
+                // Step 4: Add expense line to offset the difference
+                var expenseLineCount = vbRecord.getLineCount({ sublistId: 'expense' });
+
+                vbRecord.insertLine({
+                    sublistId: 'expense',
+                    line: expenseLineCount
+                });
+
+                vbRecord.setSublistValue({
+                    sublistId: 'expense',
+                    fieldId: 'account',
+                    line: expenseLineCount,
+                    value: '112' // Accrued Purchases
+                });
+
+                vbRecord.setSublistValue({
+                    sublistId: 'expense',
+                    fieldId: 'amount',
+                    line: expenseLineCount,
+                    value: adjustmentAmount
+                });
+
+                var memo = 'Closed Period Adj: Item ' + itemName + ' (ID: ' + itemId + ') - ' +
+                    'Orig VB Rate: $' + vbRate.toFixed(2) + ', ' +
+                    'IR Rate: $' + irRate.toFixed(2) + ', ' +
+                    'Diff: $' + adjustmentAmount.toFixed(2);
+
+                vbRecord.setSublistValue({
+                    sublistId: 'expense',
+                    fieldId: 'memo',
+                    line: expenseLineCount,
+                    value: memo
+                });
+
+                // Step 5: Validate total hasn't changed
+                var newTotal = vbRecord.getValue({ fieldId: 'total' });
+
+                if (Math.abs(newTotal - originalTotal) > 0.01) {
+                    throw new Error('VB total changed from $' + originalTotal.toFixed(2) + ' to $' + newTotal.toFixed(2) + ' - adjustment cancelled');
+                }
+
+                // Save the vendor bill
+                var savedVbId = vbRecord.save({
+                    enableSourcing: false,
+                    ignoreMandatoryFields: true
+                });
+
+                log.audit('Vendor Bill Updated', {
+                    vbId: savedVbId,
+                    adjustmentAmount: adjustmentAmount
+                });
+
+                // Step 6: Create offsetting Journal Entry
+                var jeRecord = record.create({
+                    type: record.Type.JOURNAL_ENTRY,
+                    isDynamic: false
+                });
+
+                jeRecord.setValue({
+                    fieldId: 'trandate',
+                    value: new Date()
+                });
+
+                jeRecord.setValue({
+                    fieldId: 'memo',
+                    value: 'Closed Period Adjustment for VB ' + vbNumber + ' - Item: ' + itemName
+                });
+
+                // Determine debit/credit based on adjustment amount
+                if (adjustmentAmount > 0) {
+                    // VB expense was positive, so CREDIT Accrued Purchases, DEBIT COGS
+
+                    // Line 1: CREDIT Accrued Purchases (112)
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'account',
+                        line: 0,
+                        value: '112'
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'credit',
+                        line: 0,
+                        value: adjustmentAmount
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'memo',
+                        line: 0,
+                        value: 'Offset accrued purchases - VB ' + vbNumber
+                    });
+
+                    // Line 2: DEBIT COGS (353)
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'account',
+                        line: 1,
+                        value: '353'
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'debit',
+                        line: 1,
+                        value: adjustmentAmount
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'memo',
+                        line: 1,
+                        value: 'COGS adjustment for ' + itemName
+                    });
+
+                    // Set department on COGS line
+                    var cogsDept = department === '13' ? '13' : (department === '10' ? '10' : '107');
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'department',
+                        line: 1,
+                        value: cogsDept
+                    });
+
+                } else {
+                    // VB expense was negative, so DEBIT Accrued Purchases, CREDIT COGS
+                    var absAmount = Math.abs(adjustmentAmount);
+
+                    // Line 1: DEBIT Accrued Purchases (112)
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'account',
+                        line: 0,
+                        value: '112'
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'debit',
+                        line: 0,
+                        value: absAmount
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'memo',
+                        line: 0,
+                        value: 'Offset accrued purchases - VB ' + vbNumber
+                    });
+
+                    // Line 2: CREDIT COGS (353)
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'account',
+                        line: 1,
+                        value: '353'
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'credit',
+                        line: 1,
+                        value: absAmount
+                    });
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'memo',
+                        line: 1,
+                        value: 'COGS adjustment for ' + itemName
+                    });
+
+                    // Set department on COGS line
+                    var cogsDept = department === '13' ? '13' : (department === '10' ? '10' : '107');
+                    jeRecord.setSublistValue({
+                        sublistId: 'line',
+                        fieldId: 'department',
+                        line: 1,
+                        value: cogsDept
+                    });
+                }
+
+                var jeId = jeRecord.save();
+                var jeNumber = record.load({
+                    type: record.Type.JOURNAL_ENTRY,
+                    id: jeId
+                }).getValue({ fieldId: 'tranid' });
+
+                log.audit('Journal Entry Created', {
+                    jeId: jeId,
+                    jeNumber: jeNumber
+                });
+
+                // Redirect with success message
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        adjustmentSuccess: 'true',
+                        vbNumber: vbNumber,
+                        jeNumber: jeNumber,
+                        itemName: itemName,
+                        adjustmentAmount: adjustmentAmount.toFixed(2)
+                    }
+                });
+
+            } catch (e) {
+                log.error('Closed Period Adjustment Failed', e);
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        error: 'Adjustment failed: ' + e.message,
+                        vbNumber: vbNumber
+                    }
+                });
+            }
+        }
+
         /**
          * Updates a specific line on an Item Receipt with new rate
          * @param {string} irId - Item Receipt internal ID
@@ -355,6 +659,16 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += buildUpdateSuccessMessage(params);
             }
 
+            if (params.adjustmentSuccess === 'true') {
+                html += '<div class="success-message">';
+                html += '<strong>✓ Closed Period Adjustment Complete</strong><br />';
+                html += 'Vendor Bill <strong>' + escapeHtml(params.vbNumber) + '</strong> updated<br />';
+                html += 'Item: ' + escapeHtml(params.itemName) + '<br />';
+                html += 'Adjustment Amount: $' + params.adjustmentAmount + '<br />';
+                html += 'Journal Entry <strong>' + escapeHtml(params.jeNumber) + '</strong> created';
+                html += '</div>';
+            }
+
             // Show error message if present
             if (params.error) {
                 html += '<div class="error-message">';
@@ -483,10 +797,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-       * Builds the variance table HTML
-       * @param {Array} variancePairs - Array of variance pair objects
-       * @returns {string} HTML table content
-       */
+   * Builds the variance table HTML
+   * @param {Array} variancePairs - Array of variance pair objects
+   * @returns {string} HTML table content
+   */
         function buildVarianceTable(variancePairs) {
             var html = '<form id="varianceForm" method="POST">';
             html += '<table class="variance-table">';
@@ -499,11 +813,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             html += '<th>Item</th>';
             html += '<th>IR #</th>';
             html += '<th>IR Date</th>';
+            html += '<th>Period</th>';
             html += '<th class="rate-cell">IR Rate</th>';
             html += '<th>VB #</th>';
             html += '<th>VB Date</th>';
             html += '<th>VB Rate</th>';
             html += '<th>Variance</th>';
+            html += '<th>Actions</th>';
             html += '</tr>';
             html += '</thead>';
             html += '<tbody>';
@@ -511,8 +827,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             variancePairs.forEach(function (pair) {
                 var variance = pair.vb_rate - pair.ir_rate;
                 var varianceClass = Math.abs(variance) >= 0.01 ? 'has-variance' : '';
+                var isPeriodClosed = pair.ir_period_closed;
 
-                // Create unique value for checkbox: IR_ID|PO_LINE_ID|NEW_RATE|IR_NUMBER|ITEM_NAME|ITEM_ID
                 var checkboxValue = pair.ir_id + '|' +
                     pair.ir_line_id + '|' +
                     pair.vb_rate.toFixed(2) + '|' +
@@ -520,26 +836,44 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     pair.item_name + '|' +
                     pair.item_id;
 
-                html += '<tr>';
-                html += '<td><input type="checkbox" class="variance-checkbox" value="' + escapeHtml(checkboxValue) + '" /></td>';
+                html += '<tr' + (isPeriodClosed ? ' class="closed-period-row"' : '') + '>';
+
+                // Checkbox - disabled if period is closed
+                html += '<td><input type="checkbox" class="variance-checkbox" value="' + escapeHtml(checkboxValue) + '"' +
+                    (isPeriodClosed ? ' disabled title="Period is closed"' : '') + ' /></td>';
+
                 html += '<td><a href="/app/accounting/transactions/purchord.nl?id=' + pair.po_id + '" target="_blank">' + escapeHtml(pair.po_number) + '</a></td>';
                 html += '<td>' + formatDate(pair.po_date) + '</td>';
                 html += '<td>' + escapeHtml(pair.vendor_name) + '</td>';
                 html += '<td>' + escapeHtml(pair.item_name) + '</td>';
                 html += '<td><a href="/app/accounting/transactions/itemrcpt.nl?id=' + pair.ir_id + '" target="_blank">' + escapeHtml(pair.ir_number) + '</a></td>';
                 html += '<td>' + formatDate(pair.ir_date) + '</td>';
+                html += '<td><span class="period-status ' + (isPeriodClosed ? 'period-closed' : 'period-open') + '">' +
+                    (isPeriodClosed ? '🔒 Closed' : '✓ Open') + '</span></td>';
                 html += '<td class="rate-cell">$' + pair.ir_rate.toFixed(2) + '</td>';
                 html += '<td><a href="/app/accounting/transactions/vendbill.nl?id=' + pair.vb_id + '" target="_blank">' + escapeHtml(pair.vb_number) + '</a></td>';
                 html += '<td>' + formatDate(pair.vb_date) + '</td>';
                 html += '<td class="rate-cell vb-rate">$' + pair.vb_rate.toFixed(2) + '</td>';
                 html += '<td class="variance-cell ' + varianceClass + '">$' + variance.toFixed(2) + '</td>';
+
+                // Action button - only enabled if period is closed
+                html += '<td><button type="button" class="action-button' + (isPeriodClosed ? '' : ' action-button-disabled') + '"' +
+                    (isPeriodClosed ? '' : ' disabled') +
+                    ' onclick="handleClosedPeriodAdjustment(\'' +
+                    escapeHtml(pair.vb_id) + '\',\'' +
+                    escapeHtml(pair.item_id) + '\',\'' +
+                    pair.vb_rate.toFixed(2) + '\',\'' +
+                    pair.ir_rate.toFixed(2) + '\',\'' +
+                    escapeHtml(pair.vb_number) + '\',\'' +
+                    escapeHtml(pair.item_name) + '\')">' +
+                    'Closed Period Adjustment</button></td>';
+
                 html += '</tr>';
             });
 
             html += '</tbody>';
             html += '</table>';
 
-            // Add submit button
             html += '<div class="button-container">';
             html += '<button type="button" class="submit-button" onclick="submitVariances()">Update Selected Item Receipts</button>';
             html += '</div>';
@@ -582,9 +916,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-          * Searches for IR/VB rate variances using saved search
-          * @returns {Array} Raw search results
-          */
+  * Searches for IR/VB rate variances using saved search
+  * @returns {Array} Raw search results
+  */
         function searchIRVBVariances() {
             var varianceSearch = search.create({
                 type: search.Type.TRANSACTION,
@@ -605,6 +939,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     search.createColumn({ name: 'trandate', label: 'PO Date', sort: search.Sort.ASC }),
                     search.createColumn({ name: 'entity', label: 'Vendor ID' }),
                     search.createColumn({ name: 'entityid', join: 'vendor', label: 'Vendor Name' }),
+                    search.createColumn({ name: 'altname', join: 'vendor', label: 'Vendor Display Name' }),
                     search.createColumn({ name: 'lineuniquekey', label: 'PO Line ID' }),
                     search.createColumn({ name: 'item', label: 'Item ID' }),
                     search.createColumn({ name: 'itemid', join: 'item', label: 'Item Number' }),
@@ -614,6 +949,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     search.createColumn({ name: 'internalid', join: 'fulfillingtransaction', label: 'IR ID' }),
                     search.createColumn({ name: 'tranid', join: 'fulfillingtransaction', label: 'IR Number' }),
                     search.createColumn({ name: 'trandate', join: 'fulfillingtransaction', label: 'IR Date' }),
+                    search.createColumn({ name: 'postingperiod', join: 'fulfillingtransaction', label: 'IR Period' }),
                     search.createColumn({ name: 'lineuniquekey', join: 'fulfillingtransaction', label: 'IR Line ID' }),
                     search.createColumn({ name: 'quantity', join: 'fulfillingtransaction', label: 'IR Quantity' }),
                     search.createColumn({ name: 'rate', join: 'fulfillingtransaction', label: 'IR Rate' }),
@@ -629,15 +965,35 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
             var results = [];
             varianceSearch.run().each(function (result) {
-                // Get item information using getText for display name
                 var itemName = result.getText({ name: 'item' }) || result.getValue({ name: 'displayname', join: 'item' }) || '';
                 var itemNumber = result.getValue({ name: 'item' }) || '';
+                var vendorName = result.getValue({ name: 'altname', join: 'vendor' }) ||
+                    result.getValue({ name: 'entityid', join: 'vendor' }) ||
+                    result.getText({ name: 'entity' }) ||
+                    'Unknown Vendor';
+
+                var periodId = result.getValue({ name: 'postingperiod', join: 'fulfillingtransaction' });
+                var isPeriodClosed = false;
+
+                // Lookup period status if we have a period ID
+                if (periodId) {
+                    try {
+                        var periodLookup = search.lookupFields({
+                            type: search.Type.ACCOUNTING_PERIOD,
+                            id: periodId,
+                            columns: ['closed', 'alllocked']
+                        });
+                        isPeriodClosed = periodLookup.closed || periodLookup.alllocked;
+                    } catch (e) {
+                        log.error('Period Lookup Error', 'Period ID: ' + periodId + ', Error: ' + e.message);
+                    }
+                }
 
                 results.push({
                     po_id: result.getValue({ name: 'internalid' }),
                     po_number: result.getValue({ name: 'tranid' }),
                     po_date: result.getValue({ name: 'trandate' }),
-                    vendor_name: result.getValue({ name: 'entityid', join: 'vendor' }),
+                    vendor_name: vendorName,
                     po_line_id: result.getValue({ name: 'lineuniquekey' }),
                     item_id: result.getValue({ name: 'item' }),
                     item_number: itemNumber,
@@ -646,6 +1002,8 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     ir_id: result.getValue({ name: 'internalid', join: 'fulfillingtransaction' }),
                     ir_number: result.getValue({ name: 'tranid', join: 'fulfillingtransaction' }),
                     ir_date: result.getValue({ name: 'trandate', join: 'fulfillingtransaction' }),
+                    ir_period_id: periodId,
+                    ir_period_closed: isPeriodClosed,
                     ir_line_id: result.getValue({ name: 'lineuniquekey', join: 'fulfillingtransaction' }),
                     ir_quantity: result.getValue({ name: 'quantity', join: 'fulfillingtransaction' }),
                     ir_rate: result.getValue({ name: 'rate', join: 'fulfillingtransaction' }),
@@ -656,11 +1014,10 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     vb_quantity: result.getValue({ name: 'quantity', join: 'billingtransaction' }),
                     vb_rate: result.getValue({ name: 'rate', join: 'billingtransaction' })
                 });
-                return true; // Continue iteration
+                return true;
             });
 
             log.debug('Search Results', 'Total rows: ' + results.length);
-
             return results;
         }
 
@@ -691,7 +1048,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     };
                 }
 
-                // Add Item Receipt if not already added
                 var irExists = groups[poLineKey].itemReceipts.some(function (ir) {
                     return ir.ir_line_id === row.ir_line_id;
                 });
@@ -700,13 +1056,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         ir_id: row.ir_id,
                         ir_number: row.ir_number,
                         ir_date: row.ir_date,
+                        ir_period_closed: row.ir_period_closed,
                         ir_line_id: row.ir_line_id,
                         ir_quantity: parseFloat(row.ir_quantity),
                         ir_rate: parseFloat(row.ir_rate)
                     });
                 }
 
-                // Add Vendor Bill if not already added
                 var vbExists = groups[poLineKey].vendorBills.some(function (vb) {
                     return vb.vb_line_id === row.vb_line_id;
                 });
@@ -723,7 +1079,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             });
 
             log.debug('Grouped by PO Line', 'Total PO lines with variances: ' + Object.keys(groups).length);
-
             return groups;
         }
 
@@ -738,7 +1093,6 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             Object.keys(poLineGroups).forEach(function (poLineKey) {
                 var group = poLineGroups[poLineKey];
 
-                // Sort by date (oldest first)
                 group.itemReceipts.sort(function (a, b) {
                     return new Date(a.ir_date) - new Date(b.ir_date);
                 });
@@ -746,18 +1100,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     return new Date(a.vb_date) - new Date(b.vb_date);
                 });
 
-                // Create 1:1 pairs (oldest to oldest)
                 var maxPairs = Math.max(group.itemReceipts.length, group.vendorBills.length);
 
                 for (var i = 0; i < maxPairs; i++) {
                     var ir = group.itemReceipts[i];
                     var vb = group.vendorBills[i];
 
-                    // Only create pair if both IR and VB exist
                     if (ir && vb) {
                         var variance = vb.vb_rate - ir.ir_rate;
 
-                        // Only include if variance >= $0.01
                         if (Math.abs(variance) >= 0.01) {
                             pairs.push({
                                 po_id: group.poInfo.po_id,
@@ -770,6 +1121,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                                 ir_id: ir.ir_id,
                                 ir_number: ir.ir_number,
                                 ir_date: ir.ir_date,
+                                ir_period_closed: ir.ir_period_closed,
                                 ir_line_id: ir.ir_line_id,
                                 ir_quantity: ir.ir_quantity,
                                 ir_rate: ir.ir_rate,
@@ -824,289 +1176,393 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         }
 
         /**
-         * Returns CSS styles for the page
-         * @returns {string} CSS content
-         */
+    * Returns CSS styles for the page
+    * @returns {string} CSS content
+    */
         function getStyles() {
             return `
-                * {
-                    box-sizing: border-box;
-                }
-                
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                    margin: 0;
-                    padding: 0;
-                    background: #f5f5f5;
-                }
-                
-                .container {
-                    max-width: 1600px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }
-                
-                .instructions {
-                    background: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }
-                
-                .instructions h3 {
-                    margin-top: 0;
-                    color: #1a73e8;
-                }
-                
-                .instructions ul {
-                    margin: 10px 0;
-                    padding-left: 20px;
-                }
-                
-                .instructions li {
-                    margin: 5px 0;
-                }
-                
-                .summary-info {
-                    background: #e3f2fd;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                    border-left: 4px solid #1a73e8;
-                    font-size: 16px;
-                }
-                
-                .processing-message {
-                    background: #fff3cd;
-                    border: 1px solid #ffc107;
-                    color: #856404;
-                    padding: 20px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                    text-align: center;
-                    font-size: 16px;
-                }
-                
-                .spinner {
-                    border: 4px solid #f3f3f3;
-                    border-top: 4px solid #1a73e8;
-                    border-radius: 50%;
-                    width: 40px;
-                    height: 40px;
-                    animation: spin 1s linear infinite;
-                    margin: 10px auto;
-                }
-                
-                @keyframes spin {
-                    0% { transform: rotate(0deg); }
-                    100% { transform: rotate(360deg); }
-                }
-                
-                .success-message {
-                    background: #d4edda;
-                    border: 1px solid #c3e6cb;
-                    color: #155724;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                }
-                
-                .error-message {
-                    background: #f8d7da;
-                    border: 1px solid #f5c6cb;
-                    color: #721c24;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                }
-                
-                .info-message {
-                    background: #d1ecf1;
-                    border: 1px solid #bee5eb;
-                    color: #0c5460;
-                    padding: 15px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                }
-                
-                .variance-table {
-                    width: 100%;
-                    border-collapse: collapse;
-                    background: white;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                    border-radius: 8px;
-                    overflow: hidden;
-                }
-                
-                .variance-table thead {
-                    background: #1a73e8;
-                    color: white;
-                }
-                
-                .variance-table th,
-                .variance-table td {
-                    padding: 12px;
-                    text-align: left;
-                    border-bottom: 1px solid #e0e0e0;
-                }
-                
-                .variance-table th {
-                    font-weight: 600;
-                    font-size: 13px;
-                    text-transform: uppercase;
-                    letter-spacing: 0.5px;
-                }
-                
-                .variance-table tbody tr:hover {
-                    background: #f5f5f5;
-                }
-                
-                .variance-table a {
-                    color: #1a73e8;
-                    text-decoration: none;
-                }
-                
-                .variance-table a:hover {
-                    text-decoration: underline;
-                }
-                
-                .rate-cell {
-                    text-align: right;
-                    font-family: 'Courier New', monospace;
-                }
-                
-                .vb-rate {
-                    font-weight: bold;
-                    color: #2e7d32;
-                }
-                
-                .variance-cell {
-                    text-align: right;
-                    font-family: 'Courier New', monospace;
-                }
-                
-                .has-variance {
-                    color: #d32f2f;
-                    font-weight: bold;
-                }
-                
-                .button-container {
-                    margin-top: 20px;
-                    text-align: center;
-                    padding: 20px;
-                    background: white;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }
-                
-                .submit-button {
-                    background: #1a73e8;
-                    color: white;
-                    border: none;
-                    padding: 12px 30px;
-                    font-size: 16px;
-                    font-weight: 600;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    transition: background 0.2s;
-                }
-                
-                .submit-button:hover {
-                    background: #1557b0;
-                }
-                
-                .submit-button:active {
-                    background: #0d47a1;
-                }
-                
-                #selectAll {
-                    cursor: pointer;
-                    width: 18px;
-                    height: 18px;
-                }
-                
-                .variance-checkbox {
-                    cursor: pointer;
-                    width: 18px;
-                    height: 18px;
-                }
-            `;
+        * {
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #f5f5f5;
+        }
+        
+        .container {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .instructions {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .instructions h3 {
+            margin-top: 0;
+            color: #1a73e8;
+        }
+        
+        .instructions ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        
+        .instructions li {
+            margin: 5px 0;
+        }
+        
+        .summary-info {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #1a73e8;
+            font-size: 16px;
+        }
+        
+        .processing-message {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            color: #856404;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-size: 16px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #1a73e8;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 10px auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .success-message {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .error-message {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .info-message {
+            background: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .variance-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+        }
+        
+        .variance-table thead {
+            background: #1a73e8;
+            color: white;
+        }
+        
+        .variance-table th,
+        .variance-table td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #e0e0e0;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+        }
+        
+        .variance-table th {
+            font-weight: 600;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .variance-table tbody tr:hover {
+            background: #f5f5f5;
+        }
+        
+        .closed-period-row {
+            background: #fff3cd !important;
+        }
+        
+        .closed-period-row:hover {
+            background: #ffe69c !important;
+        }
+        
+        .variance-table a {
+            color: #1a73e8;
+            text-decoration: none;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+        }
+        
+        .variance-table a:hover {
+            text-decoration: underline;
+        }
+        
+        .rate-cell {
+            text-align: right;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+        }
+        
+        .vb-rate {
+            font-weight: bold;
+            color: #2e7d32;
+        }
+        
+        .variance-cell {
+            text-align: right;
+            font-family: Arial, sans-serif;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        
+        .has-variance {
+            color: #d32f2f;
+        }
+        
+        .period-status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        
+        .period-open {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .period-closed {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .button-container {
+            margin-top: 20px;
+            text-align: center;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .submit-button {
+            background: #1a73e8;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            font-size: 16px;
+            font-weight: 600;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .submit-button:hover {
+            background: #1557b0;
+        }
+        
+        .submit-button:active {
+            background: #0d47a1;
+        }
+        
+        #selectAll {
+            cursor: pointer;
+            width: 18px;
+            height: 18px;
+        }
+        
+        .variance-checkbox {
+            cursor: pointer;
+            width: 18px;
+            height: 18px;
+        }
+        
+        .variance-checkbox:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+
+        .action-button {
+            background: #f57c00;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            font-size: 12px;
+            font-weight: 600;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+
+        .action-button:hover:not(:disabled) {
+            background: #e65100;
+        }
+
+        .action-button:active:not(:disabled) {
+            background: #d84315;
+        }
+        
+        .action-button-disabled {
+            background: #ccc !important;
+            cursor: not-allowed !important;
+            opacity: 0.5;
+        }
+    `;
         }
 
         /**
-     * Returns JavaScript for the page
-     * @returns {string} JavaScript content
-     */
+  * Returns JavaScript for the page
+  * @returns {string} JavaScript content
+  */
         function getJavaScript() {
             return `
-                // Select all checkbox functionality
-                document.addEventListener('DOMContentLoaded', function() {
-                    var selectAll = document.getElementById('selectAll');
-                    if (selectAll) {
-                        selectAll.addEventListener('change', function() {
-                            var checkboxes = document.querySelectorAll('.variance-checkbox');
-                            checkboxes.forEach(function(cb) {
-                                cb.checked = selectAll.checked;
-                            });
-                        });
-                    }
-                });
-                
-                function submitVariances() {
-                    var checkboxes = document.querySelectorAll('.variance-checkbox:checked');
-                    
-                    if (checkboxes.length === 0) {
-                        alert('Please select at least one variance to update.');
-                        return;
-                    }
-                    
-                    var confirmMessage = 'Update ' + checkboxes.length + ' Item Receipt line(s) with Vendor Bill rates?\\n\\n';
-                    confirmMessage += 'This will change the Item Receipt rate to match the Vendor Bill rate.\\n';
-                    confirmMessage += 'This action cannot be undone.\\n\\n';
-                    confirmMessage += 'Continue?';
-                    
-                    if (!confirm(confirmMessage)) {
-                        return;
-                    }
-                    
-                    // Collect selected variances
-                    var selected = [];
+        document.addEventListener('DOMContentLoaded', function() {
+            var selectAll = document.getElementById('selectAll');
+            if (selectAll) {
+                selectAll.addEventListener('change', function() {
+                    var checkboxes = document.querySelectorAll('.variance-checkbox:not(:disabled)');
                     checkboxes.forEach(function(cb) {
-                        selected.push(cb.value);
+                        cb.checked = selectAll.checked;
                     });
-                    
-                    // Find the form - try multiple selectors
-                    var form = document.getElementById('varianceForm');
-                    if (!form) {
-                        form = document.querySelector('form[id="varianceForm"]');
-                    }
-                    if (!form) {
-                        form = document.querySelector('form');
-                    }
-                    
-                    if (!form) {
-                        alert('Error: Could not find form element. Please refresh and try again.');
-                        return;
-                    }
-                    
-                    // Create hidden input and submit form
-                    var input = document.createElement('input');
-                    input.type = 'hidden';
-                    input.name = 'selected_variances';
-                    input.value = selected.join(',');
-                    form.appendChild(input);
-                    
-                    // Show loading message
-                    var submitButton = document.querySelector('.submit-button');
-                    if (submitButton) {
-                        submitButton.disabled = true;
-                        submitButton.textContent = 'Updating ' + checkboxes.length + ' record(s)...';
-                    }
-                    
-                    form.submit();
-                }
-            `;
+                });
+            }
+        });
+        
+        function submitVariances() {
+            var checkboxes = document.querySelectorAll('.variance-checkbox:checked:not(:disabled)');
+            
+            if (checkboxes.length === 0) {
+                alert('Please select at least one variance to update.\\n\\nNote: Item Receipts in closed periods cannot be updated directly. Use the "Closed Period Adjustment" button instead.');
+                return;
+            }
+            
+            var confirmMessage = 'Update ' + checkboxes.length + ' Item Receipt line(s) with Vendor Bill rates?\\n\\n';
+            confirmMessage += 'This will change the Item Receipt rate to match the Vendor Bill rate.\\n';
+            confirmMessage += 'This action cannot be undone.\\n\\n';
+            confirmMessage += 'Continue?';
+            
+            if (!confirm(confirmMessage)) {
+                return;
+            }
+            
+            var selected = [];
+            checkboxes.forEach(function(cb) {
+                selected.push(cb.value);
+            });
+            
+            var form = document.getElementById('varianceForm');
+            if (!form) {
+                form = document.querySelector('form[id="varianceForm"]');
+            }
+            if (!form) {
+                form = document.querySelector('form');
+            }
+            
+            if (!form) {
+                alert('Error: Could not find form element. Please refresh and try again.');
+                return;
+            }
+            
+            var input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'selected_variances';
+            input.value = selected.join(',');
+            form.appendChild(input);
+            
+            var submitButton = document.querySelector('.submit-button');
+            if (submitButton) {
+                submitButton.disabled = true;
+                submitButton.textContent = 'Updating ' + checkboxes.length + ' record(s)...';
+            }
+            
+            form.submit();
+        }
+        
+        function handleClosedPeriodAdjustment(vbId, itemId, vbRate, irRate, vbNumber, itemName) {
+            var confirmMsg = 'Perform Closed Period Adjustment?\\n\\n';
+            confirmMsg += 'VB: ' + vbNumber + '\\n';
+            confirmMsg += 'Item: ' + itemName + '\\n';
+            confirmMsg += 'Current VB Rate: $' + parseFloat(vbRate).toFixed(2) + '\\n';
+            confirmMsg += 'IR Rate (target): $' + parseFloat(irRate).toFixed(2) + '\\n';
+            confirmMsg += 'Adjustment: $' + (parseFloat(vbRate) - parseFloat(irRate)).toFixed(2) + '\\n\\n';
+            confirmMsg += 'This will:\\n';
+            confirmMsg += '1. Update VB item rate to match IR\\n';
+            confirmMsg += '2. Add expense line to Accrued Purchases\\n';
+            confirmMsg += '3. Create offsetting JE\\n\\n';
+            confirmMsg += 'Continue?';
+            
+            if (!confirm(confirmMsg)) {
+                return;
+            }
+            
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.style.display = 'none';
+            
+            var inputs = {
+                action: 'closed_period_adjustment',
+                vb_id: vbId,
+                item_id: itemId,
+                vb_rate: vbRate,
+                ir_rate: irRate,
+                vb_number: vbNumber,
+                item_name: itemName
+            };
+            
+            for (var key in inputs) {
+                var input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = key;
+                input.value = inputs[key];
+                form.appendChild(input);
+            }
+            
+            document.body.appendChild(form);
+            form.submit();
+        }
+    `;
         }
 
         return {
