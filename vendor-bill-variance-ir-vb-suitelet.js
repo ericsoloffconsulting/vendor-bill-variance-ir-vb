@@ -72,8 +72,14 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         function handlePost(context) {
             var request = context.request;
 
-            // Check if this is a closed period adjustment request
-            if (request.parameters.action === 'closed_period_adjustment') {
+            // Check if this is a queue for closed period adjustment request
+            if (request.parameters.action === 'queue_closed_period') {
+                handleQueueClosedPeriod(context);
+                return;
+            }
+
+            // Check if this is a process closed period adjustment request
+            if (request.parameters.action === 'process_closed_period_adjustment') {
                 handleClosedPeriodAdjustment(context);
                 return;
             }
@@ -225,7 +231,51 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             }
         }
 
-        // Add this new function after handlePost:
+        /**
+         * Handles queueing an IR for closed period adjustment
+         * @param {Object} context
+         */
+        function handleQueueClosedPeriod(context) {
+            var request = context.request;
+            var irId = request.parameters.ir_id;
+            var irNumber = request.parameters.ir_number;
+            var itemName = request.parameters.item_name;
+
+            try {
+                log.audit('Queue Closed Period Adjustment', {
+                    irId: irId,
+                    irNumber: irNumber,
+                    itemName: itemName
+                });
+
+                // Set the checkbox field on the IR using submitFields (no GL impact)
+                updateIRClosedPeriodFlag(irId, true);
+
+                // Redirect with success message
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        queueSuccess: 'true',
+                        irNumber: irNumber,
+                        itemName: itemName
+                    }
+                });
+
+            } catch (e) {
+                log.error('Queue Closed Period Adjustment Failed', e);
+
+                redirect.toSuitelet({
+                    scriptId: runtime.getCurrentScript().id,
+                    deploymentId: runtime.getCurrentScript().deploymentId,
+                    parameters: {
+                        error: 'Failed to queue IR for closed period adjustment: ' + e.message,
+                        irNumber: irNumber
+                    }
+                });
+            }
+        }
+
         /**
          * Handles closed period adjustment request
          * @param {Object} context
@@ -238,11 +288,13 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             var irRate = parseFloat(request.parameters.ir_rate);
             var vbNumber = request.parameters.vb_number;
             var itemName = request.parameters.item_name;
+            var irId = request.parameters.ir_id; // IR ID to uncheck the flag
 
             try {
                 log.audit('Closed Period Adjustment Started', {
                     vbId: vbId,
                     itemId: itemId,
+                    irId: irId,
                     vbRate: vbRate,
                     irRate: irRate
                 });
@@ -494,6 +546,9 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     jeNumber: jeNumber
                 });
 
+                // Note: IR flag is left checked to allow processing additional items on same IR
+                // Variance will disappear from report automatically once rates match
+
                 // Redirect with success message
                 redirect.toSuitelet({
                     scriptId: runtime.getCurrentScript().id,
@@ -519,6 +574,35 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     }
                 });
             }
+        }
+
+        /**
+         * Updates IR header field using submitField (no GL impact)
+         * @param {string} irId - Item Receipt internal ID
+         * @param {boolean} flagValue - True to flag for closed period adj, false to clear
+         */
+        function updateIRClosedPeriodFlag(irId, flagValue) {
+            log.debug('Updating IR Closed Period Flag', {
+                irId: irId,
+                flagValue: flagValue
+            });
+
+            record.submitFields({
+                type: record.Type.ITEM_RECEIPT,
+                id: irId,
+                values: {
+                    custbody_ir_needs_closed_period_adj: flagValue
+                },
+                options: {
+                    enableSourcing: false,
+                    ignoreMandatoryFields: true
+                }
+            });
+
+            log.audit('IR Flag Updated', {
+                irId: irId,
+                flagValue: flagValue
+            });
         }
 
         /**
@@ -659,13 +743,30 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += buildUpdateSuccessMessage(params);
             }
 
+            // Show success message if IR was queued
+            if (params.queueSuccess === 'true') {
+                html += '<div class="success-message">';
+                html += '<strong>✓ Item Receipt Queued for Closed Period Adjustment</strong><br />';
+                html += 'IR <strong>' + escapeHtml(params.irNumber) + '</strong> has been marked for closed period processing<br />';
+                html += 'Item: ' + escapeHtml(params.itemName) + '<br />';
+                html += '<br />';
+                html += '<strong>Next Steps:</strong><br />';
+                html += '1. Have accounting/admin temporarily open the closed period<br />';
+                html += '2. Reload this page - the IR will appear in the "Queued for Closed Period Adjustment" table<br />';
+                html += '3. Click "Process Adjustment" to apply the fix with no net GL impact<br />';
+                html += '4. Close the period again';
+                html += '</div>';
+            }
+
             if (params.adjustmentSuccess === 'true') {
                 html += '<div class="success-message">';
                 html += '<strong>✓ Closed Period Adjustment Complete</strong><br />';
                 html += 'Vendor Bill <strong>' + escapeHtml(params.vbNumber) + '</strong> updated<br />';
                 html += 'Item: ' + escapeHtml(params.itemName) + '<br />';
                 html += 'Adjustment Amount: $' + params.adjustmentAmount + '<br />';
-                html += 'Journal Entry <strong>' + escapeHtml(params.jeNumber) + '</strong> created';
+                html += 'Journal Entry <strong>' + escapeHtml(params.jeNumber) + '</strong> created<br />';
+                html += '<br />';
+                html += 'This variance has been resolved and will disappear from the report on refresh.';
                 html += '</div>';
             }
 
@@ -677,33 +778,117 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '</div>';
             }
 
-            // Add instructions
-            html += '<div class="instructions">';
+            // Add instructions and explanation in side-by-side layout
+            html += '<div class="instructions-container">';
+
+            // Left side - Instructions
+            html += '<div class="instructions-panel">';
             html += '<h3>Instructions</h3>';
             html += '<p>This tool identifies Item Receipts where the line rate differs from the corresponding Vendor Bill rate by $0.01 or more.</p>';
-            html += '<p><strong>Process:</strong></p>';
+            html += '<p><strong>Regular Process (Open Periods):</strong></p>';
             html += '<ul>';
-            html += '<li>Review variances below (sorted by oldest PO date first)</li>';
+            html += '<li>Review variances in the "Regular Variances" table</li>';
             html += '<li>Select the Item Receipt lines you want to update</li>';
             html += '<li>Click "Update Selected Item Receipts" to change IR rates to match VB rates</li>';
-            html += '<li>The Accrued Purchases account will be adjusted automatically</li>';
+            html += '</ul>';
+            html += '<p><strong>Closed Period Process:</strong></p>';
+            html += '<ul>';
+            html += '<li>For variances in closed periods, click "Queue for Closed Period Adjustment"</li>';
+            html += '<li>This marks the IR for special processing without GL impact</li>';
+            html += '<li>Have accounting/admin open the closed period temporarily</li>';
+            html += '<li>Queued items will appear in the "Queued for Closed Period Adjustment" table below</li>';
+            html += '<li>Once the period is open, click "Process Adjustment" to apply the fix</li>';
+            html += '<li>The period can then be closed again - no net GL impact occurred</li>';
             html += '</ul>';
             html += '<p><strong>Note:</strong> When multiple Vendor Bills exist for the same PO line, the oldest VB is matched to the oldest IR to ensure balanced accounting.</p>';
+            html += '</div>';
+
+            // Right side - Accounting Impact Explanation
+            html += '<div class="explanation-panel">';
+            html += '<h3>Accounting Impact Explanation</h3>';
+
+            html += '<p><strong>Regular Process (Open Periods):</strong></p>';
+            html += '<p style="margin-left: 10px; font-style: italic; font-size: 0.95em;">Transaction Updates:</p>';
+            html += '<ul style="margin-top: 5px;">';
+            html += '<li>Item Receipt line rate is changed to match the Vendor Bill rate</li>';
+            html += '<li>No changes to Vendor Bill</li>';
+            html += '</ul>';
+            html += '<p style="margin-left: 10px; font-style: italic; font-size: 0.95em;">GL Impact:</p>';
+            html += '<ul style="margin-top: 5px;">';
+            html += '<li>Inventory Asset account is adjusted to reflect the new cost</li>';
+            html += '<li>Closes the Accrued Purchases gap between IR and VB</li>';
+            html += '<li>COGS impact occurs later when the item is eventually sold</li>';
+            html += '</ul>';
+
+            html += '<p><strong>Closed Period Process:</strong></p>';
+            html += '<p style="margin-left: 10px; font-style: italic; font-size: 0.95em;">Transaction Updates:</p>';
+            html += '<ul style="margin-top: 5px;">';
+            html += '<li>Vendor Bill item rate is changed to match the Item Receipt rate</li>';
+            html += '<li>Vendor Bill expense line (Accrued Purchases) is added to offset the rate change and maintain the same VB total</li>';
+            html += '<li>Journal Entry is created in the current open period to reverse the VB expense line</li>';
+            html += '<li>Item Receipt remains unchanged (cannot post JE to Inventory Asset account per policy)</li>';
+            html += '</ul>';
+            html += '<p style="margin-left: 10px; font-style: italic; font-size: 0.95em;">GL Impact:</p>';
+            html += '<ul style="margin-top: 5px;">';
+            html += '<li>Accounts Payable remains unchanged (VB total protected)</li>';
+            html += '<li>Accrued Purchases gap is closed via the expense line</li>';
+            html += '<li>COGS adjustment is taken immediately in the current period (via the JE reversal)</li>';
+            html += '<li>Net $0 GL impact to the closed period</li>';
+            html += '</ul>';
+            html += '<p style="margin-left: 10px; font-style: italic; font-size: 0.95em;">Optional Follow-Up:</p>';
+            html += '<ul style="margin-top: 5px;">';
+            html += '<li>Manual Inventory Adjustment may be performed if correcting the item\'s average cost is needed</li>';
+            html += '<li>This step is not required but can be done in the current open period to adjust inventory values</li>';
+            html += '</ul>';
+
+            html += '</div>';
+
             html += '</div>';
 
             // Get variance data
             var variancePairs = getVariancePairs();
 
-            if (variancePairs.length === 0) {
+            // Split into regular variances and queued for closed period adjustment
+            var regularVariances = [];
+            var queuedVariances = [];
+
+            variancePairs.forEach(function(pair) {
+                if (pair.ir_needs_closed_period_adj) {
+                    queuedVariances.push(pair);
+                } else {
+                    regularVariances.push(pair);
+                }
+            });
+
+            if (regularVariances.length === 0 && queuedVariances.length === 0) {
                 html += '<div class="info-message">';
                 html += '<strong>ℹ No Variances Found</strong><br />';
                 html += 'All Item Receipt rates match their corresponding Vendor Bill rates.';
                 html += '</div>';
             } else {
-                html += '<div class="summary-info">';
-                html += '<strong>Total Variances Found:</strong> ' + variancePairs.length + ' line(s)';
-                html += '</div>';
-                html += buildVarianceTable(variancePairs);
+                // Regular variances table
+                if (regularVariances.length > 0) {
+                    html += '<h2 style="margin-top: 30px; color: #1a73e8;">Regular Variances</h2>';
+                    html += '<div class="summary-info">';
+                    html += '<strong>Total Regular Variances:</strong> ' + regularVariances.length + ' line(s)';
+                    html += '</div>';
+                    html += buildVarianceTable(regularVariances, 'regular');
+                } else {
+                    html += '<h2 style="margin-top: 30px; color: #1a73e8;">Regular Variances</h2>';
+                    html += '<div class="info-message">';
+                    html += '<strong>ℹ No Regular Variances</strong><br />';
+                    html += 'All non-queued variances have been resolved.';
+                    html += '</div>';
+                }
+
+                // Queued variances table
+                if (queuedVariances.length > 0) {
+                    html += '<h2 style="margin-top: 30px; color: #f57c00;">Queued for Closed Period Adjustment</h2>';
+                    html += '<div class="summary-info" style="background: #fff3cd; border-left-color: #f57c00;">';
+                    html += '<strong>Total Queued Variances:</strong> ' + queuedVariances.length + ' line(s)';
+                    html += '</div>';
+                    html += buildVarianceTable(queuedVariances, 'queued');
+                }
             }
 
             html += '</div>';
@@ -799,14 +984,26 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         /**
    * Builds the variance table HTML
    * @param {Array} variancePairs - Array of variance pair objects
+   * @param {string} tableType - Type of table: 'regular' or 'queued'
    * @returns {string} HTML table content
    */
-        function buildVarianceTable(variancePairs) {
-            var html = '<form id="varianceForm" method="POST">';
+        function buildVarianceTable(variancePairs, tableType) {
+            var isQueuedTable = tableType === 'queued';
+            var formId = isQueuedTable ? 'queuedForm' : 'varianceForm';
+            var selectAllId = isQueuedTable ? 'selectAllQueued' : 'selectAll';
+            var checkboxClass = isQueuedTable ? 'queued-checkbox' : 'variance-checkbox';
+
+            var html = '<form id="' + formId + '" method="POST">';
             html += '<table class="variance-table">';
             html += '<thead>';
             html += '<tr>';
-            html += '<th><input type="checkbox" id="selectAll" title="Select/Deselect All" /></th>';
+
+            if (!isQueuedTable) {
+                html += '<th><input type="checkbox" id="' + selectAllId + '" title="Select/Deselect All" /></th>';
+            } else {
+                html += '<th></th>'; // No select all for queued table
+            }
+
             html += '<th>PO #</th>';
             html += '<th>PO Date</th>';
             html += '<th>Vendor</th>';
@@ -838,9 +1035,15 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
 
                 html += '<tr' + (isPeriodClosed ? ' class="closed-period-row"' : '') + '>';
 
-                // Checkbox - disabled if period is closed
-                html += '<td><input type="checkbox" class="variance-checkbox" value="' + escapeHtml(checkboxValue) + '"' +
-                    (isPeriodClosed ? ' disabled title="Period is closed"' : '') + ' /></td>';
+                // Checkbox column
+                if (!isQueuedTable) {
+                    // Regular table - disabled if period is closed
+                    html += '<td><input type="checkbox" class="' + checkboxClass + '" value="' + escapeHtml(checkboxValue) + '"' +
+                        (isPeriodClosed ? ' disabled title="Period is closed"' : '') + ' /></td>';
+                } else {
+                    // Queued table - no checkbox, just empty cell
+                    html += '<td></td>';
+                }
 
                 html += '<td><a href="/app/accounting/transactions/purchord.nl?id=' + pair.po_id + '" target="_blank">' + escapeHtml(pair.po_number) + '</a></td>';
                 html += '<td>' + formatDate(pair.po_date) + '</td>';
@@ -856,17 +1059,33 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 html += '<td class="rate-cell vb-rate">$' + pair.vb_rate.toFixed(2) + '</td>';
                 html += '<td class="variance-cell ' + varianceClass + '">$' + variance.toFixed(2) + '</td>';
 
-                // Action button - only enabled if period is closed
-                html += '<td><button type="button" class="action-button' + (isPeriodClosed ? '' : ' action-button-disabled') + '"' +
-                    (isPeriodClosed ? '' : ' disabled') +
-                    ' onclick="handleClosedPeriodAdjustment(\'' +
-                    escapeHtml(pair.vb_id) + '\',\'' +
-                    escapeHtml(pair.item_id) + '\',\'' +
-                    pair.vb_rate.toFixed(2) + '\',\'' +
-                    pair.ir_rate.toFixed(2) + '\',\'' +
-                    escapeHtml(pair.vb_number) + '\',\'' +
-                    escapeHtml(pair.item_name) + '\')">' +
-                    'Closed Period Adjustment</button></td>';
+                // Action buttons - different for each table type
+                html += '<td>';
+                if (!isQueuedTable) {
+                    // Regular table: "Queue for Closed Period Adjustment" button (only show if period is closed)
+                    if (isPeriodClosed) {
+                        html += '<button type="button" class="action-button queue-button" ' +
+                            'onclick="queueForClosedPeriodAdjustment(\'' +
+                            escapeHtml(pair.ir_id) + '\',\'' +
+                            escapeHtml(pair.ir_number) + '\',\'' +
+                            escapeHtml(pair.item_name) + '\')">' +
+                            'Queue for Closed Period Adj</button>';
+                    }
+                } else {
+                    // Queued table: "Process Closed Period Adjustment" button (disabled if period still closed)
+                    html += '<button type="button" class="action-button process-button' + (isPeriodClosed ? ' action-button-disabled' : '') + '"' +
+                        (isPeriodClosed ? ' disabled title="Period must be opened first"' : '') +
+                        ' onclick="processClosedPeriodAdjustment(\'' +
+                        escapeHtml(pair.vb_id) + '\',\'' +
+                        escapeHtml(pair.item_id) + '\',\'' +
+                        pair.vb_rate.toFixed(2) + '\',\'' +
+                        pair.ir_rate.toFixed(2) + '\',\'' +
+                        escapeHtml(pair.vb_number) + '\',\'' +
+                        escapeHtml(pair.item_name) + '\',\'' +
+                        escapeHtml(pair.ir_id) + '\')">' +
+                        (isPeriodClosed ? '⏳ Waiting for Period Open' : '✓ Process Adjustment') + '</button>';
+                }
+                html += '</td>';
 
                 html += '</tr>';
             });
@@ -874,9 +1093,12 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             html += '</tbody>';
             html += '</table>';
 
-            html += '<div class="button-container">';
-            html += '<button type="button" class="submit-button" onclick="submitVariances()">Update Selected Item Receipts</button>';
-            html += '</div>';
+            // Submit button only for regular table
+            if (!isQueuedTable) {
+                html += '<div class="button-container">';
+                html += '<button type="button" class="submit-button" onclick="submitVariances()">Update Selected Item Receipts</button>';
+                html += '</div>';
+            }
 
             html += '</form>';
 
@@ -953,6 +1175,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     search.createColumn({ name: 'lineuniquekey', join: 'fulfillingtransaction', label: 'IR Line ID' }),
                     search.createColumn({ name: 'quantity', join: 'fulfillingtransaction', label: 'IR Quantity' }),
                     search.createColumn({ name: 'rate', join: 'fulfillingtransaction', label: 'IR Rate' }),
+                    search.createColumn({ name: 'custbody_ir_needs_closed_period_adj', join: 'fulfillingtransaction', label: 'IR Needs Closed Period Adj' }),
                     // Vendor Bill columns
                     search.createColumn({ name: 'internalid', join: 'billingtransaction', label: 'VB ID' }),
                     search.createColumn({ name: 'tranid', join: 'billingtransaction', label: 'VB Number' }),
@@ -981,13 +1204,52 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         var periodLookup = search.lookupFields({
                             type: search.Type.ACCOUNTING_PERIOD,
                             id: periodId,
-                            columns: ['closed', 'alllocked']
+                            columns: ['periodname', 'closed', 'alllocked', 'aplocked', 'arlocked', 'payrolllocked']
                         });
-                        isPeriodClosed = periodLookup.closed || periodLookup.alllocked;
+
+                        // DEBUG: Log what NetSuite actually returns
+                        log.debug('Period Lookup Debug', {
+                            periodId: periodId,
+                            periodName: periodLookup.periodname,
+                            closedValue: periodLookup.closed,
+                            closedType: typeof periodLookup.closed,
+                            closedIsArray: Array.isArray(periodLookup.closed),
+                            alllockedValue: periodLookup.alllocked,
+                            alllockedType: typeof periodLookup.alllocked,
+                            alllockedIsArray: Array.isArray(periodLookup.alllocked),
+                            aplockedValue: periodLookup.aplocked,
+                            arlockedValue: periodLookup.arlocked,
+                            payrolllockedValue: periodLookup.payrolllocked
+                        });
+
+                        // NetSuite returns checkbox fields as 'T' or 'F' strings, or as arrays [true]/[false]
+                        var isClosed = (periodLookup.closed === 'T' || periodLookup.closed === true ||
+                                       (Array.isArray(periodLookup.closed) && periodLookup.closed[0] === true));
+                        var isAllLocked = (periodLookup.alllocked === 'T' || periodLookup.alllocked === true ||
+                                          (Array.isArray(periodLookup.alllocked) && periodLookup.alllocked[0] === true));
+                        var isAPLocked = (periodLookup.aplocked === 'T' || periodLookup.aplocked === true ||
+                                         (Array.isArray(periodLookup.aplocked) && periodLookup.aplocked[0] === true));
+
+                        // Only check if period is truly closed (not AP/AR locked)
+                        // Administrator with "Override Period Restriction" can bypass AP/AR/Payroll locks
+                        // So we only need to check the main "Closed" checkbox
+                        isPeriodClosed = isClosed;
+
+                        log.debug('Period Status Evaluation', {
+                            periodId: periodId,
+                            periodName: periodLookup.periodname,
+                            isClosed: isClosed,
+                            isAllLocked: isAllLocked,
+                            isAPLocked: isAPLocked,
+                            finalIsPeriodClosed: isPeriodClosed,
+                            note: 'Only checking isClosed - Admin can override AP/AR locks'
+                        });
                     } catch (e) {
                         log.error('Period Lookup Error', 'Period ID: ' + periodId + ', Error: ' + e.message);
                     }
                 }
+
+                var needsClosedPeriodAdj = result.getValue({ name: 'custbody_ir_needs_closed_period_adj', join: 'fulfillingtransaction' });
 
                 results.push({
                     po_id: result.getValue({ name: 'internalid' }),
@@ -1004,6 +1266,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     ir_date: result.getValue({ name: 'trandate', join: 'fulfillingtransaction' }),
                     ir_period_id: periodId,
                     ir_period_closed: isPeriodClosed,
+                    ir_needs_closed_period_adj: needsClosedPeriodAdj === 'T' || needsClosedPeriodAdj === true,
                     ir_line_id: result.getValue({ name: 'lineuniquekey', join: 'fulfillingtransaction' }),
                     ir_quantity: result.getValue({ name: 'quantity', join: 'fulfillingtransaction' }),
                     ir_rate: result.getValue({ name: 'rate', join: 'fulfillingtransaction' }),
@@ -1057,6 +1320,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                         ir_number: row.ir_number,
                         ir_date: row.ir_date,
                         ir_period_closed: row.ir_period_closed,
+                        ir_needs_closed_period_adj: row.ir_needs_closed_period_adj,
                         ir_line_id: row.ir_line_id,
                         ir_quantity: parseFloat(row.ir_quantity),
                         ir_rate: parseFloat(row.ir_rate)
@@ -1122,6 +1386,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                                 ir_number: ir.ir_number,
                                 ir_date: ir.ir_date,
                                 ir_period_closed: ir.ir_period_closed,
+                                ir_needs_closed_period_adj: ir.ir_needs_closed_period_adj,
                                 ir_line_id: ir.ir_line_id,
                                 ir_quantity: ir.ir_quantity,
                                 ir_rate: ir.ir_rate,
@@ -1198,26 +1463,51 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             padding: 20px;
         }
         
-        .instructions {
+        .instructions-container {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .instructions-panel, .explanation-panel {
+            flex: 1;
             background: white;
             padding: 20px;
             border-radius: 8px;
-            margin-bottom: 20px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        
-        .instructions h3 {
+
+        .instructions-panel {
+            border-left: 4px solid #1a73e8;
+        }
+
+        .explanation-panel {
+            border-left: 4px solid #34a853;
+        }
+
+        .instructions-panel h3 {
             margin-top: 0;
             color: #1a73e8;
         }
-        
-        .instructions ul {
-            margin: 10px 0;
-            padding-left: 20px;
+
+        .explanation-panel h3 {
+            margin-top: 0;
+            color: #34a853;
         }
-        
-        .instructions li {
-            margin: 5px 0;
+
+        .instructions-panel ul, .explanation-panel ul {
+            margin: 5px 0 15px 20px;
+            padding: 0;
+        }
+
+        .instructions-panel li, .explanation-panel li {
+            margin-bottom: 8px;
+        }
+
+        @media (max-width: 1200px) {
+            .instructions-container {
+                flex-direction: column;
+            }
         }
         
         .summary-info {
@@ -1443,11 +1733,27 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         .action-button:active:not(:disabled) {
             background: #d84315;
         }
-        
+
         .action-button-disabled {
             background: #ccc !important;
             cursor: not-allowed !important;
             opacity: 0.5;
+        }
+
+        .queue-button {
+            background: #ff9800;
+        }
+
+        .queue-button:hover:not(:disabled) {
+            background: #f57c00;
+        }
+
+        .process-button {
+            background: #4caf50;
+        }
+
+        .process-button:hover:not(:disabled) {
+            background: #388e3c;
         }
     `;
         }
@@ -1519,9 +1825,47 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             
             form.submit();
         }
-        
-        function handleClosedPeriodAdjustment(vbId, itemId, vbRate, irRate, vbNumber, itemName) {
-            var confirmMsg = 'Perform Closed Period Adjustment?\\n\\n';
+
+        function queueForClosedPeriodAdjustment(irId, irNumber, itemName) {
+            var confirmMsg = 'Queue this Item Receipt for Closed Period Adjustment?\\n\\n';
+            confirmMsg += 'IR: ' + irNumber + '\\n';
+            confirmMsg += 'Item: ' + itemName + '\\n\\n';
+            confirmMsg += 'This will mark the IR for special processing.\\n';
+            confirmMsg += 'You will then need to:\\n';
+            confirmMsg += '1. Have the period temporarily opened\\n';
+            confirmMsg += '2. Process the adjustment (with no net GL impact)\\n';
+            confirmMsg += '3. Close the period again\\n\\n';
+            confirmMsg += 'Continue?';
+
+            if (!confirm(confirmMsg)) {
+                return;
+            }
+
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.style.display = 'none';
+
+            var inputs = {
+                action: 'queue_closed_period',
+                ir_id: irId,
+                ir_number: irNumber,
+                item_name: itemName
+            };
+
+            for (var key in inputs) {
+                var input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = key;
+                input.value = inputs[key];
+                form.appendChild(input);
+            }
+
+            document.body.appendChild(form);
+            form.submit();
+        }
+
+        function processClosedPeriodAdjustment(vbId, itemId, vbRate, irRate, vbNumber, itemName, irId) {
+            var confirmMsg = 'Process Closed Period Adjustment?\\n\\n';
             confirmMsg += 'VB: ' + vbNumber + '\\n';
             confirmMsg += 'Item: ' + itemName + '\\n';
             confirmMsg += 'Current VB Rate: $' + parseFloat(vbRate).toFixed(2) + '\\n';
@@ -1530,27 +1874,30 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
             confirmMsg += 'This will:\\n';
             confirmMsg += '1. Update VB item rate to match IR\\n';
             confirmMsg += '2. Add expense line to Accrued Purchases\\n';
-            confirmMsg += '3. Create offsetting JE\\n\\n';
+            confirmMsg += '3. Create offsetting JE\\n';
+            confirmMsg += '4. Remove this variance from the report\\n\\n';
+            confirmMsg += 'No net GL impact will occur.\\n\\n';
             confirmMsg += 'Continue?';
-            
+
             if (!confirm(confirmMsg)) {
                 return;
             }
-            
+
             var form = document.createElement('form');
             form.method = 'POST';
             form.style.display = 'none';
-            
+
             var inputs = {
-                action: 'closed_period_adjustment',
+                action: 'process_closed_period_adjustment',
                 vb_id: vbId,
                 item_id: itemId,
                 vb_rate: vbRate,
                 ir_rate: irRate,
                 vb_number: vbNumber,
-                item_name: itemName
+                item_name: itemName,
+                ir_id: irId
             };
-            
+
             for (var key in inputs) {
                 var input = document.createElement('input');
                 input.type = 'hidden';
@@ -1558,7 +1905,7 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                 input.value = inputs[key];
                 form.appendChild(input);
             }
-            
+
             document.body.appendChild(form);
             form.submit();
         }
