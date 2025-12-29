@@ -356,6 +356,20 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
         function buildPageHTML(params) {
             var html = '<style>' + getStyles() + '</style>';
             html += '<div class="container">';
+            
+            // SOP Quick Link (top right)
+            html += '<div class="sop-link-container">';
+            html += '<a href="https://8289753.app.netsuite.com/app/site/hosting/scriptlet.nl?script=3923&deploy=1#12" target="_blank" class="sop-quick-link">';
+            html += '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 6px; vertical-align: middle;">';
+            html += '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>';
+            html += '<polyline points="14 2 14 8 20 8"></polyline>';
+            html += '<line x1="16" y1="13" x2="8" y2="13"></line>';
+            html += '<line x1="16" y1="17" x2="8" y2="17"></line>';
+            html += '<polyline points="10 9 9 9 8 9"></polyline>';
+            html += '</svg>';
+            html += '<span>SOP Quick Link</span>';
+            html += '</a>';
+            html += '</div>';
 
             var locationFilter = params.location_filter || 'all';
 
@@ -913,6 +927,47 @@ define(['N/ui/serverWidget', 'N/search', 'N/record', 'N/redirect', 'N/log', 'N/r
                     max-width: 1800px;
                     margin: 0 auto;
                     padding: 20px;
+                    position: relative;
+                }
+                
+                .sop-link-container {
+                    position: absolute;
+                    top: 0;
+                    right: 0;
+                    z-index: 100;
+                }
+                
+                .sop-quick-link {
+                    display: inline-flex;
+                    align-items: center;
+                    padding: 10px 18px;
+                    background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 13px;
+                    box-shadow: 0 4px 6px rgba(76, 175, 80, 0.3), 0 1px 3px rgba(0, 0, 0, 0.1);
+                    transition: all 0.3s ease;
+                    border: 2px solid rgba(255, 255, 255, 0.2);
+                }
+                
+                .sop-quick-link:hover {
+                    background: linear-gradient(135deg, #45a049 0%, #4CAF50 100%);
+                    transform: translateY(-2px);
+                    box-shadow: 0 6px 12px rgba(76, 175, 80, 0.4), 0 2px 4px rgba(0, 0, 0, 0.15);
+                    text-decoration: none;
+                    color: white;
+                    border-color: rgba(255, 255, 255, 0.3);
+                }
+                
+                .sop-quick-link:active {
+                    transform: translateY(0px);
+                    box-shadow: 0 2px 4px rgba(76, 175, 80, 0.3), 0 1px 2px rgba(0, 0, 0, 0.1);
+                }
+                
+                .sop-quick-link svg {
+                    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.2));
                 }
                 
                 .filter-section {
